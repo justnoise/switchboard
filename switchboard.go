@@ -10,6 +10,7 @@ import (
 
 	"github.com/hpcloud/tail"
 	"github.com/justnoise/fsnotify"
+	uuid "github.com/satori/go.uuid"
 )
 
 const maxUnits = 10
@@ -65,16 +66,26 @@ func (s *Switchboard) runSwitchboard() {
 			if event.Op&fsnotify.Open == fsnotify.Open {
 				ct := openCount[event.Name]
 				if ct == 0 {
+					// prevent races on close by opening the file here
+					uid := uuid.NewV4().String()
+					f, err := os.OpenFile(
+						event.Name, os.O_WRONLY|os.O_APPEND, 0666)
+					if err != nil {
+						fmt.Println("Error opening file for pumping logs", event.Name)
+						continue
+					}
+
 					c := make(chan struct{}, 1)
 					quitChans[event.Name] = c
-					go pumpLogs(event.Name, c)
+					go pumpLogs(uid, f, event.Name, c)
 				}
 				openCount[event.Name] += 1
+				fmt.Println(openCount[event.Name])
 			}
 			if event.Op&fsnotify.Close == fsnotify.Close {
 				ct := openCount[event.Name]
 				c, exists := quitChans[event.Name]
-				fmt.Println("close", ct, exists)
+				fmt.Println("closing", event.Name, ct, exists)
 				if !exists {
 					// got ourselves closing the file, this is OK
 					delete(openCount, event.Name)
@@ -91,17 +102,13 @@ func (s *Switchboard) runSwitchboard() {
 	}
 }
 
-func pumpLogs(path string, quit chan struct{}) {
-	fmt.Println("pumping logs to", path)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		fmt.Println("Error opening file for pumping logs")
-	}
+func pumpLogs(uid string, f *os.File, fullPath string, quit chan struct{}) {
+	fmt.Println(uid, "pumping logs to", fullPath)
 	t := time.NewTicker(1 * time.Second)
 	for {
 		select {
 		case <-quit:
-			fmt.Println("Stopping pumping logs for", path)
+			fmt.Println(uid, "Stopping pumping logs for", fullPath)
 			err := f.Truncate(0)
 			if err != nil {
 				fmt.Println("Error truncating file", err)
@@ -110,7 +117,7 @@ func pumpLogs(path string, quit chan struct{}) {
 			t.Stop()
 			return
 		case <-t.C:
-			msg := fmt.Sprintf("Logs for %s at %v\n", path, time.Now())
+			msg := fmt.Sprintf("%s, Logs for %s at %v\n", uid, fullPath, time.Now())
 			_, err := f.Write([]byte(msg))
 			if err != nil {
 				fmt.Println("Error writing to logfile", err)
@@ -150,19 +157,19 @@ func (s *Switchboard) fileCreator() {
 		add := diffUnit(units, knownUnits)
 		del := diffUnit(knownUnits, units)
 		for _, u := range add {
-			path := path.Join(baseDir, u.Name)
-			_, err := os.Create(path)
+			p := path.Join(baseDir, u.Name)
+			_, err := os.Create(p)
 			if err != nil {
 				panic(err)
 			}
 			knownUnits[u.Name] = u
-			_ = s.watcher.Add(path)
-			fmt.Println("watching", path)
+			_ = s.watcher.Add(p)
+			fmt.Println("watching", p)
 		}
 		for _, u := range del {
-			path := path.Join(baseDir, u.Name)
-			_ = s.watcher.Remove(path)
-			err := os.Remove(path)
+			p := path.Join(baseDir, u.Name)
+			_ = s.watcher.Remove(p)
+			err := os.Remove(p)
 			if err != nil {
 				panic(err)
 			}
@@ -191,8 +198,8 @@ func unitReader() {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-
-		readTime := time.Duration(rand.Intn(10)) * time.Second
+		unit = units["7"]
+		readTime := time.Duration(rand.Intn(3)) * time.Second
 		start := time.Now()
 		fmt.Printf("tailing file %s for %v seconds\n", unit.Name, readTime.Seconds())
 		t, err := tail.TailFile(unit.Name, tail.Config{Follow: true})
